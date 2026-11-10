@@ -104,6 +104,25 @@ static const CurvatureSteeringLimits FORD_STEERING_LIMITS = {
 #define FORD_PATH_ANGLE_MAX_DELTA 100      // per 20 Hz frame while winding up: 0.05 rad, 1.0 rad/s
 #define FORD_PATH_ANGLE_MAX_SPEED 4.5      // m/s: no path angle command above this
 
+// Lateral-only control, opt-in (safety param bit 8, debug builds only, CAN FD only).
+// The driver's lane centering button on the wheel asks for it and takes it back; the brake does not end it.
+//   granted  on a press, if cruise is switched on (CcStat_D_Actl standby or active) and nothing is at fault
+//   removed  on the next press, when cruise is switched off or faults, and by every fault that also clears
+//            controls_allowed: a bad or late checked message, a speed mismatch, a relay malfunction, and openpilot
+//            not reporting itself engaged for three heartbeats
+// It allows the steering message only. Nothing longitudinal and no button message asks get_lateral_allowed().
+// The button is read from the car's own Steering_Data_FD1 on the main bus; what openpilot sends is never received.
+#define FORD_PARAM_LAT_ONLY 8U
+
+static bool ford_lat_only_enabled(void) {
+#ifdef ALLOW_DEBUG
+  const uint16_t FORD_PARAM_CANFD_ = 2;
+  return GET_FLAG(safety_setup.current_safety_param, FORD_PARAM_LAT_ONLY) && GET_FLAG(safety_setup.current_safety_param, FORD_PARAM_CANFD_);
+#else
+  return false;
+#endif
+}
+
 static bool ford_path_angle_enabled(void) {
 #ifdef ALLOW_DEBUG
   return GET_FLAG(safety_setup.current_safety_param, FORD_PARAM_PATH_ANGLE);
@@ -116,7 +135,7 @@ static bool ford_path_angle_enabled(void) {
 static bool ford_path_angle_cmd_checks(int desired_path_angle, bool curvature_requested, bool steer_control_enabled) {
   bool violation = false;
 
-  if (!ford_path_angle_enabled() || !safety.controls_allowed || !steer_control_enabled) {
+  if (!ford_path_angle_enabled() || !get_lateral_allowed() || !steer_control_enabled) {
     // not opted in, or not steering: the signal stays at zero
     violation |= desired_path_angle != 0;
   } else if (desired_path_angle != 0) {
@@ -195,6 +214,26 @@ static void ford_rx_hook(const CANPacket_t *msg) {
     unsigned int cruise_state = msg->data[1] & 0x07U;
     bool cruise_engaged = (cruise_state == 4U) || (cruise_state == 5U);
     pcm_cruise_check(cruise_engaged);
+
+    // lateral-only needs cruise switched on: standby (3) or engaged. Off (0) and the fault states (1, 2) end it.
+    safety.ford_cruise_available = (cruise_state == 3U) || cruise_engaged;
+    if (!safety.ford_cruise_available) {
+      safety.lateral_only_allowed = false;
+    }
+  }
+
+  // The driver's lane centering button. Only in the rx checks, so only delivered here, when lateral-only is opted in
+  if (msg_matches(msg, FORD_Steering_Data_FD1, FORD_MAIN_BUS)) {
+    // Signal: TjaButtnOnOffPress
+    bool pressed = (msg->data[5] & 0x1U) != 0U;
+    if (pressed && !safety.ford_lat_button_prev && ford_lat_only_enabled()) {
+      if (safety.lateral_only_allowed) {
+        safety.lateral_only_allowed = false;
+      } else {
+        safety.lateral_only_allowed = safety.ford_cruise_available && !safety.relay_malfunction && !safety.safety_rx_checks_invalid;
+      }
+    }
+    safety.ford_lat_button_prev = pressed;
   }
 }
 
@@ -328,18 +367,29 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
 static safety_config ford_init(uint16_t param) {
   // warning: quality flags are not yet checked in openpilot's CAN parser,
   // this may be the cause of blocked messages
+  // FORD_EngVehicleSpThrottle2 has a counter that either randomly skips or by 2, likely ECU bug
+  // Some hybrid models also experience a bug where this checksum mismatches for one or two frames under heavy acceleration with ACC
+  // It has been confirmed that the Bronco Sport's camera only disallows ACC for bad quality flags, not counters or checksums, so we match that
+  // The last three have no counter or checksum
+  #define FORD_COMMON_RX_CHECKS \
+    {.msg = {{FORD_BrakeSysFeatures, 0, 8, 50U, .max_counter = 15U}, { 0 }, { 0 }}}, \
+    {.msg = {{FORD_EngVehicleSpThrottle2, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}}, \
+    {.msg = {{FORD_Yaw_Data_FD1, 0, 8, 100U, .max_counter = 255U}, { 0 }, { 0 }}}, \
+    {.msg = {{FORD_EngBrakeData, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+    {.msg = {{FORD_EngVehicleSpThrottle, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+    {.msg = {{FORD_DesiredTorqBrk, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+
   static const RxCheck ford_rx_checks[] = {
-    {.msg = {{FORD_BrakeSysFeatures, 0, 8, 50U, .max_counter = 15U}, { 0 }, { 0 }}},
-    // FORD_EngVehicleSpThrottle2 has a counter that either randomly skips or by 2, likely ECU bug
-    // Some hybrid models also experience a bug where this checksum mismatches for one or two frames under heavy acceleration with ACC
-    // It has been confirmed that the Bronco Sport's camera only disallows ACC for bad quality flags, not counters or checksums, so we match that
-    {.msg = {{FORD_EngVehicleSpThrottle2, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},
-    {.msg = {{FORD_Yaw_Data_FD1, 0, 8, 100U, .max_counter = 255U}, { 0 }, { 0 }}},
-    // These messages have no counter or checksum
-    {.msg = {{FORD_EngBrakeData, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{FORD_EngVehicleSpThrottle, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{FORD_DesiredTorqBrk, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    FORD_COMMON_RX_CHECKS
   };
+
+#ifdef ALLOW_DEBUG
+  // Lateral-only: the car's own button message is received and has to stay alive (10 Hz, no counter or checksum).
+  static const RxCheck ford_lat_only_rx_checks[] = {
+    FORD_COMMON_RX_CHECKS
+    {.msg = {{FORD_Steering_Data_FD1, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+  };
+#endif
 
   #define FORD_COMMON_TX_MSGS \
     {FORD_Steering_Data_FD1, 0, 8, .check_relay = false}, \
@@ -375,8 +425,17 @@ static safety_config ford_init(uint16_t param) {
     ret = BUILD_SAFETY_CFG(ford_rx_checks, FORD_CANFD_STOCK_TX_MSGS);
 #ifdef ALLOW_DEBUG
     const uint16_t FORD_PARAM_LONGITUDINAL = 1;
-    if (GET_FLAG(param, FORD_PARAM_LONGITUDINAL)) {
+    const bool ford_long = GET_FLAG(param, FORD_PARAM_LONGITUDINAL);
+    if (GET_FLAG(param, FORD_PARAM_LAT_ONLY)) {
+      if (ford_long) {
+        ret = BUILD_SAFETY_CFG(ford_lat_only_rx_checks, FORD_CANFD_LONG_TX_MSGS);
+      } else {
+        ret = BUILD_SAFETY_CFG(ford_lat_only_rx_checks, FORD_CANFD_STOCK_TX_MSGS);
+      }
+    } else if (ford_long) {
       ret = BUILD_SAFETY_CFG(ford_rx_checks, FORD_CANFD_LONG_TX_MSGS);
+    } else {
+      // stock longitudinal, set above
     }
 #endif
   } else {

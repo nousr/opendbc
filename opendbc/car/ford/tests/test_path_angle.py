@@ -17,7 +17,7 @@ from pathlib import Path
 
 from opendbc.can import CANPacker
 from opendbc.car import DT_CTRL, gen_empty_fingerprint, structs
-from opendbc.car.ford import path_angle
+from opendbc.car.ford import lateral_only, path_angle
 from opendbc.car.ford.interface import CarInterface
 from opendbc.car.ford.path_angle import PathAngleTest, Profile, Stage
 from opendbc.car.ford.values import CAR, CarControllerParams as P, FordFlags, FordSafetyFlags
@@ -47,11 +47,16 @@ def decode(dat: bytes) -> dict:
 class Bench:
   """A Mach-E's CarInterface and panda's Ford safety, stepped together at 100 Hz."""
 
-  def __init__(self, opt_in: bool = True, alpha_long: bool = True):
+  def __init__(self, opt_in: bool = True, alpha_long: bool = True, steering_only: bool = False):
+    """steering_only: the session as it will run. Panda's controls_allowed stays false, cruise is in standby with
+    the brake pedal down, and steering is allowed by the driver's lane centering button alone (lateral_only)."""
     CP = CarInterface.get_params(CAR.FORD_MUSTANG_MACH_E_MK1, gen_empty_fingerprint(), [], alpha_long, False, False)
     self.default_flags, self.default_param = CP.flags, CP.safetyConfigs[-1].safetyParam
     if opt_in:
       path_angle.enable(CP)
+    self.steering_only = steering_only
+    if steering_only:
+      lateral_only.enable(CP)
     self.CP = CP
     self.CI = CarInterface(CP)
     self.CI.update([])                       # stock-message defaults the controller passes through
@@ -86,7 +91,14 @@ class Bench:
     self._rx("BrakeSysFeatures", {"Veh_V_ActlBrk": pv * 3.6, "VehVActlBrk_D_Qf": 3})
     self._rx("EngVehicleSpThrottle2", {"Veh_V_ActlEng": pv * 3.6, "VehVActlEng_D_Qf": 3})
     self._rx("Yaw_Data_FD1", {"VehYaw_W_Actl": 0.0, "VehYawWActl_D_Qf": 3})
-    self.safety.set_controls_allowed(lat_active)
+    if self.steering_only:
+      self._rx("EngBrakeData", {"BpedDrvAppl_D_Actl": 2, "CcStat_D_Actl": 3})
+      if self.frame == 0:
+        for pressed_ in (0, 1, 0):
+          self._rx("Steering_Data_FD1", {"TjaButtnOnOffPress": pressed_})
+      assert not self.safety.get_controls_allowed()
+    else:
+      self.safety.set_controls_allowed(lat_active)
 
     _, can_sends = self.CI.apply(CC.as_reader(), int(self.frame * DT_CTRL * 1e9))
     row = None
@@ -346,6 +358,28 @@ class TestPathAngleBench(unittest.TestCase):
     self.assertTrue(b.CI.CC.lkas_enabled_last)
     b.steer_frame(torque=0.8)
     self.assertEqual(set(ui_states(b, 20)), {False})
+
+  def test_the_session_as_it_will_run_steering_only_with_the_brake_down(self):
+    # no ACC, panda's controls_allowed false throughout, brake pedal down: the same frames, all accepted
+    engaged, only = self.bench(0.3, -0.3), Bench(steering_only=True)
+    only.test.arm([Profile(0.3), Profile(-0.3)])
+    self.assertEqual(only.CP.safetyConfigs[-1].safetyParam, engaged.CP.safetyConfigs[-1].safetyParam | 8)
+    rows = []
+    for b in (engaged, only):
+      b.run(12)
+      rows.append([(r["mode"], r["path_angle"], r["curvature"], r["ramp"], r["accepted"]) for r in b.play() + b.play()])
+      self.assertEqual(b.refused, [], "nothing openpilot sent was refused: steering, ACC, HUD or buttons")
+      self.assertFalse(b.safety.safety_redundancy_fault)
+    self.assertEqual(rows[0], rows[1])
+    self.assertEqual(max(r[1] for r in rows[1]), 600)
+    self.assertEqual(min(r[1] for r in rows[1]), -600)
+    self.assertTrue(only.safety.get_lateral_only_allowed())
+    # and the driver's button takes it back in panda whatever the controller does next
+    for pressed in (1, 0):
+      only._rx("Steering_Data_FD1", {"TjaButtnOnOffPress": pressed})
+    self.assertFalse(only.safety.get_lateral_only_allowed())
+    row = only.steer_frame()
+    self.assertEqual((row["mode"], row["accepted"]), (1, False), "steering requested with neither permission")
 
   def test_a_press_between_steer_frames_counts(self):
     for offset in range(5):

@@ -65,6 +65,10 @@ void set_relay_malfunction(bool c){
   SAFETY_SET(relay_malfunction, c);
 }
 
+bool get_lateral_only_allowed(void){
+  return safety.lateral_only_allowed;
+}
+
 bool get_controls_allowed(void){
   return safety.controls_allowed;
 }

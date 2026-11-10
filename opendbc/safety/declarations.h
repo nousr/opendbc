@@ -242,6 +242,7 @@ bool safety_tx_hook(CANPacket_t *msg);
 int to_signed(int d, int bits);
 void update_sample(struct sample_t *sample, int sample_new);
 bool get_longitudinal_allowed(void);
+bool get_lateral_allowed(void);
 int ROUND(float val);
 bool steer_torque_cmd_checks(int desired_torque, int steer_req, const TorqueSteeringLimits limits);
 bool steer_angle_cmd_checks(int desired_angle, bool steer_control_enabled, const AngleSteeringLimits limits);
@@ -286,6 +287,11 @@ typedef struct {
 typedef struct {
   // This can be set by the safety hooks
   bool controls_allowed;
+  // The driver asked for steering only, with the pedals their own: steering commands may be sent, nothing
+  // longitudinal. Kept apart from controls_allowed, which the brake and the cruise state clear. Set only by a safety
+  // mode that reads the driver's own request off the bus (Ford, opted in); cleared by every fault that clears
+  // controls_allowed. See get_lateral_allowed().
+  bool lateral_only_allowed;
   bool relay_malfunction;
   bool gas_pressed;
   bool gas_pressed_prev;
@@ -327,6 +333,8 @@ typedef struct {
 
   // last accepted Ford path angle command, wire units. Per copy: both copies check every frame against their own
   int ford_path_angle_last;
+  bool ford_cruise_available;         // CcStat_D_Actl standby or active: the driver has cruise switched on
+  bool ford_lat_button_prev;          // lane centering button on the wheel, last sample
 
   // time since safety mode has been changed
   uint32_t safety_mode_cnt;

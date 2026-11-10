@@ -696,5 +696,272 @@ class TestFordCANFDPathAngleSafety(TestFordCANFDLongitudinalSafety):
         self.assertTrue(self._pa(0))
 
 
+class TestFordCANFDLateralOnlySafety(TestFordCANFDLongitudinalSafety):
+  """Lateral-only control, opted in. Every stock test runs with the opt-in set and must still hold: the bit by
+  itself changes nothing. The driver's lane centering button then grants a permission of its own, which lets the
+  steering message through and nothing else, and which the brake does not end."""
+
+  SAFETY_PARAM = FordSafetyFlags.LONG_CONTROL | FordSafetyFlags.CANFD | FordSafetyFlags.LAT_ONLY
+  SPEED = 3.0
+
+  def tearDown(self):
+    self.assertFalse(self.safety.safety_redundancy_fault, "the two safety copies disagreed")
+    super().tearDown()
+
+  # ---- messages from the car
+
+  def _cruise(self, state: int, brake: bool = False):
+    """EngBrakeData with CcStat_D_Actl: 0 off, 1-2 faults, 3 standby, 4-5 engaged."""
+    return self._rx(self.packer.make_can_msg_safety("EngBrakeData", 0, {"BpedDrvAppl_D_Actl": 2 if brake else 1, "CcStat_D_Actl": state}))
+
+  def _button(self, pressed: bool, bus: int = 0):
+    return self._rx(self.packer.make_can_msg_safety("Steering_Data_FD1", bus, {"TjaButtnOnOffPress": 1 if pressed else 0}))
+
+  def _press(self, bus: int = 0):
+    self._button(True, bus)
+    self._button(True, bus)      # held for a second frame: still one press
+    self._button(False, bus)
+
+  def _ready(self, param=None, cruise: int = 3, speed=None):
+    """Fresh state, cruise switched on and waiting, driving straight, openpilot not engaged with ACC."""
+    self.safety.set_safety_hooks(self.SAFETY_MODEL, self.SAFETY_PARAM if param is None else param)
+    self.safety.init_tests()
+    self._reset_curvature_measurement(0, self.SPEED if speed is None else speed)
+    self._cruise(cruise)
+    self._button(False)
+    self.assertEqual(self.safety.get_controls_allowed(), cruise in (4, 5))
+    self.assertFalse(self.safety.get_lateral_only_allowed())
+
+  def _granted(self, **kw):
+    self._ready(**kw)
+    self._press()
+    self.assertTrue(self.safety.get_lateral_only_allowed())
+
+  def _steer(self, curvature: float = 0.001, enabled: bool = True):
+    self._set_prev_desired_angle(curvature)
+    return self._tx(self._lat_ctl_msg(enabled, 0, 0, curvature, 0))
+
+  # ---- granting and removing
+
+  def test_the_bit_alone_grants_nothing(self):
+    self._ready()
+    self.assertFalse(self._steer())
+    self.assertTrue(self._steer(0, enabled=False))
+
+  def test_without_the_opt_in_the_button_does_nothing(self):
+    for param in (FordSafetyFlags.LONG_CONTROL | FordSafetyFlags.CANFD, FordSafetyFlags.CANFD, FordSafetyFlags.LAT_ONLY,
+                  FordSafetyFlags.LONG_CONTROL | FordSafetyFlags.CANFD | FordSafetyFlags.PATH_ANGLE):
+      with self.subTest(param=int(param)):
+        self._ready(param=param)
+        self._press()
+        self.assertFalse(self.safety.get_lateral_only_allowed())
+        if param & FordSafetyFlags.CANFD:
+          self.assertFalse(self._steer())
+
+  def test_a_press_grants_steering_and_nothing_else(self):
+    for cruise in (3, ):
+      self._granted(cruise=cruise)
+      self.assertFalse(self.safety.get_controls_allowed())
+      self.assertTrue(self._steer())
+      self.assertTrue(self._steer(-0.001))
+      # nothing longitudinal: no gas, no brake, no brake actuation, no resume press
+      self.assertFalse(self._tx(self._acc_command_msg(self.MAX_GAS, self.INACTIVE_ACCEL, False)))
+      self.assertFalse(self._tx(self._acc_command_msg(self.INACTIVE_GAS, self.MIN_ACCEL, True)))
+      self.assertFalse(self._tx(self._acc_command_msg(self.INACTIVE_GAS, self.INACTIVE_ACCEL, True)))
+      self.assertTrue(self._tx(self._acc_command_msg(self.INACTIVE_GAS, self.INACTIVE_ACCEL, False)), "the inactive frame is always allowed")
+      for bus in (0, 2):
+        self.assertFalse(self._tx(self._acc_button_msg(Buttons.RESUME, bus)))
+        self.assertFalse(self._tx(self._acc_button_msg(Buttons.CANCEL, bus)), "cancel only while cruise is engaged")
+
+  def test_the_steering_limits_are_the_engaged_ones(self):
+    # the same frames, once fully engaged and once lateral-only, get the same answers
+    def answers(lateral_only):
+      out = []
+      for speed in (3.0, 9.0, self.CURVATURE_ERROR_MIN_SPEED + 5):
+        for curvature in (0.0, 0.0005, 0.004, 0.012, 0.02, 0.021, -0.0005, -0.02, -0.021):
+          for measured in (0.0, curvature):
+            if lateral_only:
+              self._granted(speed=speed)
+            else:
+              self._ready(speed=speed)
+              self.safety.set_controls_allowed(True)
+            self._reset_curvature_measurement(measured, speed)
+            self._set_prev_desired_angle(curvature)
+            out.append((speed, curvature, measured, self._tx(self._lat_ctl_msg(True, 0, 0, curvature, 0)),
+                        self._tx(self._lat_ctl_msg(True, 0.5, 0, curvature, 0)), self._tx(self._lat_ctl_msg(True, 0, 0.1, curvature, 0)),
+                        self._tx(self._lat_ctl_msg(True, 0, 0, curvature, 0.0005))))
+      return out
+    engaged, lateral_only = answers(False), answers(True)
+    self.assertEqual(engaged, lateral_only)
+    self.assertTrue(any(row[3] for row in engaged) and not all(row[3] for row in engaged), "the sweep crosses the limits")
+    self.assertFalse(any(any(row[4:]) for row in engaged), "path offset, path angle and curvature rate stay refused")
+
+  def test_the_brake_and_the_accelerator_do_not_end_it(self):
+    self._granted()
+    for moving in (True, False):
+      self._rx(self._vehicle_moving_msg(self.SPEED if moving else 0))
+      self._cruise(3, brake=True)
+      self.assertTrue(self.safety.get_lateral_only_allowed())
+      self.assertTrue(self._steer())
+      self._cruise(3, brake=False)
+      self._rx(self._user_gas_msg(50))
+      self.assertTrue(self.safety.get_lateral_only_allowed())
+      self.assertTrue(self._steer())
+      self._rx(self._user_gas_msg(0))
+
+  def test_the_brake_still_ends_full_engagement_and_leaves_steering(self):
+    self._granted()
+    self._cruise(5)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._rx(self._vehicle_moving_msg(self.SPEED))
+    self._cruise(5, brake=True)
+    self.assertFalse(self.safety.get_controls_allowed(), "the brake ends controls_allowed as it always did")
+    self.assertFalse(self._tx(self._acc_command_msg(self.MAX_GAS, self.INACTIVE_ACCEL, False)))
+    self.assertTrue(self.safety.get_lateral_only_allowed())
+    self.assertTrue(self._steer())
+
+  def test_the_next_press_removes_it(self):
+    self._granted()
+    self._press()
+    self.assertFalse(self.safety.get_lateral_only_allowed())
+    self.assertFalse(self._steer())
+    self.assertTrue(self._steer(0, enabled=False))
+    self._press()
+    self.assertTrue(self.safety.get_lateral_only_allowed())
+
+  def test_a_held_button_is_one_press(self):
+    self._ready()
+    for _ in range(50):
+      self._button(True)
+      self.assertTrue(self.safety.get_lateral_only_allowed())
+    self._button(False)
+    self.assertTrue(self.safety.get_lateral_only_allowed())
+
+  def test_a_button_already_held_when_the_mode_is_set_is_not_a_press(self):
+    self.safety.set_safety_hooks(self.SAFETY_MODEL, self.SAFETY_PARAM)
+    self.safety.init_tests()
+    self._cruise(3)
+    self._button(True)
+    self.assertTrue(self.safety.get_lateral_only_allowed(), "the first frame seen pressed is an edge: there is no earlier sample")
+    # so the host must not rely on it: selfdrived needs its own edge too. What matters here: it is one grant, not a toggle storm
+    self._button(True)
+    self.assertTrue(self.safety.get_lateral_only_allowed())
+
+  def test_cruise_must_be_switched_on(self):
+    for state in (0, 1, 2):
+      with self.subTest(state=state):
+        self._ready(cruise=state)
+        self._press()
+        self.assertFalse(self.safety.get_lateral_only_allowed(), "no grant with cruise off or faulted")
+        self._granted()
+        self._cruise(state)
+        self.assertFalse(self.safety.get_lateral_only_allowed(), "and it ends when cruise is switched off or faults")
+        self.assertFalse(self._steer())
+        self._cruise(3)
+        self.assertFalse(self.safety.get_lateral_only_allowed(), "switching cruise back on is not a request")
+    for state in (3, 4, 5):
+      with self.subTest(state=state):
+        self._ready(cruise=state)
+        self._press()
+        self.assertTrue(self.safety.get_lateral_only_allowed())
+
+  def test_only_the_cars_own_button_on_the_main_bus_counts(self):
+    self._ready()
+    self._press(bus=2)
+    self.assertFalse(self.safety.get_lateral_only_allowed(), "the camera side")
+    for bus in (0, 2):
+      self._tx(self._acc_button_msg(Buttons.TJA_TOGGLE, bus))
+      self._tx(self._acc_button_msg(-1, bus))
+      self.assertFalse(self.safety.get_lateral_only_allowed(), "a button message openpilot sends")
+    self._granted()
+    for bus in (0, 2):
+      self._tx(self._acc_button_msg(Buttons.TJA_TOGGLE, bus))
+      self._tx(self._acc_button_msg(-1, bus))
+      self.assertTrue(self.safety.get_lateral_only_allowed(), "nor can openpilot take it away or toggle it")
+
+  # ---- every fault that ends controls_allowed ends it too
+
+  def test_openpilot_not_engaged_for_three_heartbeats_ends_it(self):
+    self._granted()
+    self.safety.safety_heartbeat(True)
+    for _ in range(10):
+      self.safety.safety_heartbeat_check()
+    self.assertTrue(self.safety.get_lateral_only_allowed())
+    self.safety.safety_heartbeat(False)
+    for expected in (True, True, False):
+      self.safety.safety_heartbeat_check()
+      self.assertEqual(self.safety.get_lateral_only_allowed(), expected)
+    self.assertFalse(self._steer())
+    # a new grant gets the full three again, not what was left of the last count
+    self._press()
+    for expected in (True, True, False):
+      self.safety.safety_heartbeat_check()
+      self.assertEqual(self.safety.get_lateral_only_allowed(), expected)
+
+  def test_a_checked_message_going_missing_ends_it(self):
+    lag_us = 1000000
+    n = self.safety.get_rx_checks_len()
+    self.assertEqual(n, 7, "the six stock checks and the button message")
+    for stale in range(n):
+      for age, allowed in ((lag_us, True), (lag_us + 1, False)):
+        with self.subTest(stale=stale, age=age):
+          self._granted()
+          self.safety.set_timer(2 * lag_us)
+          for i in range(n):
+            self.safety.set_rx_checks_received(i, 0)
+          self.safety.set_rx_checks_received(stale, age)
+          self.safety.safety_tick()
+          self.assertEqual(self.safety.get_lateral_only_allowed(), allowed)
+          self.assertEqual(self._steer(), allowed)
+          if not allowed:
+            self._press()
+            self.assertFalse(self.safety.get_lateral_only_allowed(), "and no new grant while a check is failing")
+
+  def test_the_stock_configuration_does_not_check_the_button_message(self):
+    self.safety.set_safety_hooks(self.SAFETY_MODEL, FordSafetyFlags.LONG_CONTROL | FordSafetyFlags.CANFD)
+    self.safety.init_tests()
+    self.assertEqual(self.safety.get_rx_checks_len(), 6)
+
+  def test_a_bad_checked_message_ends_it(self):
+    self._granted()
+    self._rx(self._speed_msg(self.SPEED, quality_flag=False))
+    self.assertFalse(self.safety.get_lateral_only_allowed())
+
+  def test_a_speed_mismatch_ends_it(self):
+    self._granted()
+    self._rx(self._speed_msg(self.SPEED))
+    self._rx(self._speed_msg_2(self.SPEED + 5))
+    self.assertFalse(self._steer(), "the curvature check compares the two speeds and refuses")
+    self.assertFalse(self.safety.get_lateral_only_allowed())
+
+  def test_a_relay_malfunction_ends_it(self):
+    self._granted()
+    self._rx(self._lat_ctl_msg(True, 0, 0, 0.001, 0))            # the stock camera's steering message on our bus
+    self.assertTrue(self.safety.get_relay_malfunction())
+    self.assertFalse(self.safety.get_lateral_only_allowed())
+    self._press()
+    self.assertFalse(self.safety.get_lateral_only_allowed())
+
+  def test_setting_the_mode_again_ends_it(self):
+    self._granted()
+    self.safety.set_safety_hooks(self.SAFETY_MODEL, self.SAFETY_PARAM)
+    self.assertFalse(self.safety.get_lateral_only_allowed())
+    self._granted()
+    self.safety.set_safety_hooks(CarParams.SafetyModel.noOutput, 0)
+    self.assertFalse(self.safety.get_lateral_only_allowed())
+
+  def test_the_path_angle_command_under_lateral_only(self):
+    # Stage A as it will run: steering only, pedals the driver's own, path angle opted in for the drive
+    param = self.SAFETY_PARAM | FordSafetyFlags.PATH_ANGLE
+    self._granted(param=param, speed=2.0)
+    self._cruise(3, brake=True)
+    for can in (100, 200, 300, 200, 0):
+      self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, can / 2000, 0, 0)), can)
+    self._press()
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.05, 0, 0)))
+    self.assertFalse(self._tx(self._lat_ctl_msg(False, 0, 0.05, 0, 0)))
+    self.assertTrue(self._tx(self._lat_ctl_msg(False, 0, 0, 0, 0)))
+
+
 if __name__ == "__main__":
   unittest.main()

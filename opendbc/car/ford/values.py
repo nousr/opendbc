@@ -51,6 +51,7 @@ class FordSafetyFlags(IntFlag):
   LONG_CONTROL = 1
   CANFD = 2
   PATH_ANGLE = 4  # low-speed path angle command; honoured by debug panda builds only
+  LAT_ONLY = 8    # lateral-only control on the driver's lane centering button; debug panda builds only
 
 
 class FordFlags(IntFlag):
@@ -62,6 +63,8 @@ class FordFlags(IntFlag):
 
   # Opt-in, set by the host through path_angle.enable(), never by fingerprint
   PATH_ANGLE = 4
+  # Opt-in, set by the host through lateral_only.enable(), never by fingerprint
+  LAT_ONLY = 8
 
 
 class RADAR:

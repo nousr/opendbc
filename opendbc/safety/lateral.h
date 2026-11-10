@@ -241,6 +241,12 @@ bool steer_angle_cmd_checks(int desired_angle, bool steer_control_enabled, const
   return violation;
 }
 
+// Steering may be commanded: fully engaged, or the driver asked for steering only (declarations.h).
+// Only the curvature checks, and Ford's path angle check, ask this; every other check still asks controls_allowed.
+bool get_lateral_allowed(void) {
+  return safety.controls_allowed || safety.lateral_only_allowed;
+}
+
 // Safety checks for curvature-based steering commands
 bool steer_curvature_cmd_checks(int desired_curvature, int steer_power, bool steer_control_enabled, const CurvatureSteeringLimits limits) {
   // Highway curves are rolled in the direction of the turn, add tolerance to compensate
@@ -253,7 +259,7 @@ bool steer_curvature_cmd_checks(int desired_curvature, int steer_power, bool ste
 
   speed_mismatch_check((float)safety.vehicle_speed_2.values[0] / VEHICLE_SPEED_FACTOR);
 
-  if (safety.controls_allowed && steer_control_enabled) {
+  if (get_lateral_allowed() && steer_control_enabled) {
     // *** absolute curvature cap ***
     violation |= safety_max_limit_check(desired_curvature, limits.max_curvature, -limits.max_curvature);
 
@@ -322,11 +328,11 @@ bool steer_curvature_cmd_checks(int desired_curvature, int steer_power, bool ste
   if (limits.max_steer_power != 0) {
     violation |= safety_max_limit_check(steer_power, limits.max_steer_power, 0);
     violation |= (steer_power != 0) && !steer_control_enabled;
-    violation |= !safety.controls_allowed && (steer_power != 0) && (steer_power >= safety.curvature_state.steer_power_last);
+    violation |= !get_lateral_allowed() && (steer_power != 0) && (steer_power >= safety.curvature_state.steer_power_last);
     safety.curvature_state.steer_power_last = steer_power;
   } else {
     // No curvature control allowed when controls are not allowed
-    violation |= !safety.controls_allowed && steer_control_enabled;
+    violation |= !get_lateral_allowed() && steer_control_enabled;
   }
 
   if (violation) {

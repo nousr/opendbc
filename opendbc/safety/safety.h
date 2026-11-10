@@ -91,6 +91,7 @@ static bool is_msg_valid(int index) {
     if (!status->valid_checksum || !status->valid_quality_flag || (status->wrong_counters >= MAX_WRONG_COUNTERS)) {
       valid = false;
       safety.controls_allowed = false;
+      safety.lateral_only_allowed = false;
     }
   }
   return valid;
@@ -169,6 +170,7 @@ static bool rx_msg_safety_check(const CANPacket_t *msg,
 
 static bool rx_hook_copy(const CANPacket_t *msg) {
   bool controls_allowed_prev = safety.controls_allowed;
+  bool lateral_only_allowed_prev = safety.lateral_only_allowed;
 
   bool valid = rx_msg_safety_check(msg, &safety_setup.current_safety_config, safety_setup.current_hooks);
   bool whitelisted = get_addr_check_index(msg, safety_setup.current_safety_config.rx_checks, safety_setup.current_safety_config.rx_checks_len) != -1;
@@ -191,7 +193,7 @@ static bool rx_hook_copy(const CANPacket_t *msg) {
   }
 
   // reset mismatches on rising edge of controls_allowed to avoid rare race condition
-  if (safety.controls_allowed && !controls_allowed_prev) {
+  if ((safety.controls_allowed && !controls_allowed_prev) || (safety.lateral_only_allowed && !lateral_only_allowed_prev)) {
     safety.heartbeat_engaged_mismatches = 0;
   }
 
@@ -280,6 +282,7 @@ static void tick_copy(void) {
     if (lagging || frequency_invalid || !is_msg_valid(i)) {
       rx_checks_invalid = true;
       safety.controls_allowed = false;
+      safety.lateral_only_allowed = false;
     }
   }
 
@@ -288,10 +291,11 @@ static void tick_copy(void) {
 
 static void heartbeat_check_copy(void) {
   // exit controls allowed if unused by openpilot for a few seconds
-  if (safety.controls_allowed && !safety.heartbeat_engaged) {
+  if ((safety.controls_allowed || safety.lateral_only_allowed) && !safety.heartbeat_engaged) {
     safety.heartbeat_engaged_mismatches += 1U;
     if (safety.heartbeat_engaged_mismatches >= 3U) {
       safety.controls_allowed = false;
+      safety.lateral_only_allowed = false;
     }
   } else {
     safety.heartbeat_engaged_mismatches = 0U;
@@ -300,6 +304,7 @@ static void heartbeat_check_copy(void) {
 
 static void relay_malfunction_set(void) {
   safety.relay_malfunction = true;
+  safety.lateral_only_allowed = false;
 }
 
 static void generic_rx_checks(void) {
@@ -516,5 +521,6 @@ void speed_mismatch_check(const float speed_2) {
   bool is_invalid_speed = SAFETY_ABS(ROUND(speed_2 * VEHICLE_SPEED_FACTOR) - safety.vehicle_speed.values[0]) > MAX_SPEED_DELTA;
   if (is_invalid_speed) {
     safety.controls_allowed = false;
+    safety.lateral_only_allowed = false;
   }
 }
