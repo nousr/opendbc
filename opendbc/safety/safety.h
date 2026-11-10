@@ -444,9 +444,29 @@ void safety_tick(void) {
   (void)safety_redundancy_check(safety_states_equal());
 }
 
+// Lateral-only is the driver's request, held only while openpilot is using it. pandad's heartbeat (10 Hz) says
+// whether openpilot is engaged: this many in a row saying it is not, counted from the request, end the permission.
+// So a request openpilot refused, and one it has let go of, are both gone in about half a second, and the next
+// press is a fresh request whatever came before. Long enough for a heartbeat that reports openpilot's state late.
+#define LATERAL_ONLY_IDLE_MAX 5U
+
+static void heartbeat_copy(bool engaged) {
+  safety.heartbeat_engaged = engaged;
+  if (engaged || !safety.lateral_only_allowed) {
+    safety.lateral_only_idle = 0U;
+  } else {
+    safety.lateral_only_idle += 1U;
+    if (safety.lateral_only_idle >= LATERAL_ONLY_IDLE_MAX) {
+      safety.lateral_only_allowed = false;
+    }
+  }
+}
+
 void safety_heartbeat(bool engaged) {
-  safety_a.state.heartbeat_engaged = engaged;
-  safety_b.state.heartbeat_engaged = engaged;
+  current_copy = &safety_b;
+  heartbeat_copy(engaged);
+  current_copy = &safety_a;
+  heartbeat_copy(engaged);
 }
 
 void safety_alternative_experience(int alt_exp) {

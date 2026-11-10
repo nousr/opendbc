@@ -290,8 +290,10 @@ typedef struct {
   // The driver asked for steering only, with the pedals their own: steering commands may be sent, nothing
   // longitudinal. Kept apart from controls_allowed, which the brake and the cruise state clear. Set only by a safety
   // mode that reads the driver's own request off the bus (Ford, opted in); cleared by every fault that clears
-  // controls_allowed. See get_lateral_allowed().
+  // controls_allowed, and when openpilot does not take it up or lets it go (LATERAL_ONLY_IDLE_MAX).
+  // See get_lateral_allowed().
   bool lateral_only_allowed;
+  uint32_t lateral_only_idle;         // heartbeats in a row, since the request, with openpilot not engaged
   bool relay_malfunction;
   bool gas_pressed;
   bool gas_pressed_prev;

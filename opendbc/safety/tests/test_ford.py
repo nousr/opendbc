@@ -714,8 +714,17 @@ class TestFordCANFDLateralOnlySafety(TestFordCANFDLongitudinalSafety):
     """EngBrakeData with CcStat_D_Actl: 0 off, 1-2 faults, 3 standby, 4-5 engaged."""
     return self._rx(self.packer.make_can_msg_safety("EngBrakeData", 0, {"BpedDrvAppl_D_Actl": 2 if brake else 1, "CcStat_D_Actl": state}))
 
-  def _button(self, pressed: bool, bus: int = 0):
-    return self._rx(self.packer.make_can_msg_safety("Steering_Data_FD1", bus, {"TjaButtnOnOffPress": 1 if pressed else 0}))
+  def _button(self, pressed: bool, bus: int = 0, cancel: bool = False):
+    values = {"TjaButtnOnOffPress": 1 if pressed else 0, "CcAslButtnCnclPress": 1 if cancel else 0}
+    return self._rx(self.packer.make_can_msg_safety("Steering_Data_FD1", bus, values))
+
+  def _cancel(self, bus: int = 0):
+    self._button(False, bus, cancel=True)
+    self._button(False, bus)
+
+  def _heartbeats(self, engaged: bool, n: int = 1):
+    for _ in range(n):
+      self.safety.safety_heartbeat(engaged)
 
   def _press(self, bus: int = 0):
     self._button(True, bus)
@@ -820,14 +829,99 @@ class TestFordCANFDLateralOnlySafety(TestFordCANFDLongitudinalSafety):
     self.assertTrue(self.safety.get_lateral_only_allowed())
     self.assertTrue(self._steer())
 
-  def test_the_next_press_removes_it(self):
+  # ---- a press only ever asks. What takes it back: openpilot not using it, the cancel button, cruise off, faults
+
+  IDLE_MAX = 5       # heartbeats in a row with openpilot not engaged
+
+  def test_a_second_press_does_not_remove_it(self):
+    # whether a press means on or off depends on openpilot's state at that instant, which panda does not have.
+    # Toggling here put the two out of step whenever openpilot refused or ended an engagement by itself.
     self._granted()
+    self._heartbeats(True, 3)
+    for _ in range(3):
+      self._press()
+      self.assertTrue(self.safety.get_lateral_only_allowed())
+      self.assertTrue(self._steer())
+
+  def test_openpilot_not_taking_it_up_ends_it(self):
+    self._granted()
+    for expected in [True] * (self.IDLE_MAX - 1) + [False]:
+      self._heartbeats(False)
+      self.assertEqual(self.safety.get_lateral_only_allowed(), expected)
+    self.assertFalse(self._steer())
+    self._heartbeats(True, 3)
+    self.assertFalse(self.safety.get_lateral_only_allowed(), "openpilot engaging afterwards is not a request")
+
+  def test_openpilot_letting_go_ends_it(self):
+    self._granted()
+    self._heartbeats(True, 50)
+    self.assertTrue(self.safety.get_lateral_only_allowed(), "engaged: it stays as long as that lasts")
+    self._heartbeats(False, self.IDLE_MAX - 1)
+    self.assertTrue(self._steer())
+    self._heartbeats(False)
+    self.assertFalse(self.safety.get_lateral_only_allowed())
+    self.assertFalse(self._steer())
+
+  def test_the_count_is_of_heartbeats_in_a_row(self):
+    self._granted()
+    for _ in range(10):
+      self._heartbeats(False, self.IDLE_MAX - 1)
+      self._heartbeats(True)
+    self.assertTrue(self.safety.get_lateral_only_allowed())
+
+  def test_a_press_is_a_fresh_request_whatever_came_before(self):
+    # refused or let go, then pressed again before the count ran out: the new request gets the whole count
+    self._granted()
+    self._heartbeats(False, self.IDLE_MAX - 1)
     self._press()
+    self._heartbeats(False, self.IDLE_MAX - 1)
+    self.assertTrue(self.safety.get_lateral_only_allowed())
+    self._heartbeats(True)
+    self.assertTrue(self._steer())
+    # and after it ran out, a press grants again
+    self._heartbeats(False, self.IDLE_MAX)
+    self.assertFalse(self.safety.get_lateral_only_allowed())
+    self._press()
+    self.assertTrue(self.safety.get_lateral_only_allowed())
+
+  def test_the_count_does_not_run_while_there_is_nothing_to_end(self):
+    self._ready()
+    self._heartbeats(False, 50)
+    self._press()
+    self._heartbeats(False, self.IDLE_MAX - 1)
+    self.assertTrue(self.safety.get_lateral_only_allowed(), "heartbeats before the request are not held against it")
+
+  def test_the_cancel_button_removes_it_whatever_openpilot_says(self):
+    self._granted()
+    self._heartbeats(True, 5)
+    self._cancel()
     self.assertFalse(self.safety.get_lateral_only_allowed())
     self.assertFalse(self._steer())
     self.assertTrue(self._steer(0, enabled=False))
+    self._heartbeats(True, 5)
+    self.assertFalse(self.safety.get_lateral_only_allowed())
     self._press()
-    self.assertTrue(self.safety.get_lateral_only_allowed())
+    self.assertTrue(self.safety.get_lateral_only_allowed(), "and the next press asks again")
+
+  def test_cancel_wins_over_a_lane_centering_press_in_the_same_message(self):
+    self._ready()
+    self._button(True, cancel=True)
+    self.assertFalse(self.safety.get_lateral_only_allowed())
+    self._button(True, cancel=True)
+    self._button(True)                 # cancel released with lane centering still held: no new edge, no grant
+    self.assertFalse(self.safety.get_lateral_only_allowed())
+    self._granted()
+    self._button(True, cancel=True)
+    self.assertFalse(self.safety.get_lateral_only_allowed())
+
+  def test_only_the_cars_own_cancel_on_the_main_bus_counts(self):
+    self._granted()
+    self._cancel(bus=2)
+    self.assertTrue(self.safety.get_lateral_only_allowed(), "the camera side")
+    self._cruise(5)                    # cruise engaged, so openpilot's own cancel message is one it may send
+    for bus in (0, 2):
+      self.assertTrue(self._tx(self._acc_button_msg(Buttons.CANCEL, bus)))
+      self.assertTrue(self.safety.get_lateral_only_allowed(), "a cancel openpilot sends is not the driver's")
 
   def test_a_held_button_is_one_press(self):
     self._ready()
@@ -836,6 +930,13 @@ class TestFordCANFDLateralOnlySafety(TestFordCANFDLongitudinalSafety):
       self.assertTrue(self.safety.get_lateral_only_allowed())
     self._button(False)
     self.assertTrue(self.safety.get_lateral_only_allowed())
+    # and it is one request: held through the whole count, it is not asked again
+    self._ready()
+    self._button(True)
+    for _ in range(self.IDLE_MAX):
+      self._button(True)
+      self._heartbeats(False)
+    self.assertFalse(self.safety.get_lateral_only_allowed())
 
   def test_a_button_already_held_when_the_mode_is_set_is_not_a_press(self):
     self.safety.set_safety_hooks(self.SAFETY_MODEL, self.SAFETY_PARAM)
@@ -877,7 +978,7 @@ class TestFordCANFDLateralOnlySafety(TestFordCANFDLongitudinalSafety):
     for bus in (0, 2):
       self._tx(self._acc_button_msg(Buttons.TJA_TOGGLE, bus))
       self._tx(self._acc_button_msg(-1, bus))
-      self.assertTrue(self.safety.get_lateral_only_allowed(), "nor can openpilot take it away or toggle it")
+      self.assertTrue(self.safety.get_lateral_only_allowed(), "nor does anything openpilot sends take it away")
 
   # ---- every fault that ends controls_allowed ends it too
 
@@ -897,6 +998,7 @@ class TestFordCANFDLateralOnlySafety(TestFordCANFDLongitudinalSafety):
     for expected in (True, True, False):
       self.safety.safety_heartbeat_check()
       self.assertEqual(self.safety.get_lateral_only_allowed(), expected)
+    # (the 1 Hz check is the stock one, kept; with pandad's 10 Hz heartbeat the count above ends it first)
 
   def test_a_checked_message_going_missing_ends_it(self):
     lag_us = 1000000
@@ -957,7 +1059,7 @@ class TestFordCANFDLateralOnlySafety(TestFordCANFDLongitudinalSafety):
     self._cruise(3, brake=True)
     for can in (100, 200, 300, 200, 0):
       self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, can / 2000, 0, 0)), can)
-    self._press()
+    self._cancel()
     self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.05, 0, 0)))
     self.assertFalse(self._tx(self._lat_ctl_msg(False, 0, 0.05, 0, 0)))
     self.assertTrue(self._tx(self._lat_ctl_msg(False, 0, 0, 0, 0)))

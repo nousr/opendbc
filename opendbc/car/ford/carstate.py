@@ -19,6 +19,7 @@ class CarState(CarStateBase):
 
     self.distance_button = 0
     self.lc_button = 0
+    self.cancel_button = 0
 
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
@@ -109,10 +110,20 @@ class CarState(CarStateBase):
     self.acc_tja_status_stock_values = cp_cam.vl["ACCDATA_3"]
     self.lkas_status_stock_values = cp_cam.vl["IPMA_Data"]
 
-    ret.buttonEvents = [
+    button_events = [
       *create_button_events(self.distance_button, prev_distance_button, {1: ButtonType.gapAdjustCruise}),
       *create_button_events(self.lc_button, prev_lc_button, {1: ButtonType.lkas}),
     ]
+
+    # Lateral-only (opted in): the cancel button ends it, here as in panda. Not reported otherwise, so nothing
+    # changes for a car that is not opted in.
+    if self.CP.flags & FordFlags.LAT_ONLY:
+      prev_cancel_button = self.cancel_button
+      self.cancel_button = int(cp.vl["Steering_Data_FD1"]["CcAslButtnCnclPress"])
+      button_events += create_button_events(self.cancel_button, prev_cancel_button, {1: ButtonType.cancel})
+
+    # assigned once: reading the list back out of the message and assigning it again loses what was in it
+    ret.buttonEvents = button_events
 
     return ret
 

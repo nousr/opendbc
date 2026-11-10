@@ -374,9 +374,9 @@ class TestPathAngleBench(unittest.TestCase):
     self.assertEqual(max(r[1] for r in rows[1]), 600)
     self.assertEqual(min(r[1] for r in rows[1]), -600)
     self.assertTrue(only.safety.get_lateral_only_allowed())
-    # and the driver's button takes it back in panda whatever the controller does next
+    # and the driver's cancel button takes it back in panda whatever the controller does next
     for pressed in (1, 0):
-      only._rx("Steering_Data_FD1", {"TjaButtnOnOffPress": pressed})
+      only._rx("Steering_Data_FD1", {"CcAslButtnCnclPress": pressed})
     self.assertFalse(only.safety.get_lateral_only_allowed())
     row = only.steer_frame()
     self.assertEqual((row["mode"], row["accepted"]), (1, False), "steering requested with neither permission")

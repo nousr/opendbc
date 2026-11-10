@@ -105,13 +105,18 @@ static const CurvatureSteeringLimits FORD_STEERING_LIMITS = {
 #define FORD_PATH_ANGLE_MAX_SPEED 4.5      // m/s: no path angle command above this
 
 // Lateral-only control, opt-in (safety param bit 8, debug builds only, CAN FD only).
-// The driver's lane centering button on the wheel asks for it and takes it back; the brake does not end it.
-//   granted  on a press, if cruise is switched on (CcStat_D_Actl standby or active) and nothing is at fault
-//   removed  on the next press, when cruise is switched off or faults, and by every fault that also clears
-//            controls_allowed: a bad or late checked message, a speed mismatch, a relay malfunction, and openpilot
-//            not reporting itself engaged for three heartbeats
+// The driver's lane centering button on the wheel asks for it; the brake does not end it.
+//   granted  on every press, if cruise is switched on (CcStat_D_Actl standby or active) and nothing is at fault.
+//            A press never removes it here: whether a press means on or off depends on whether openpilot is
+//            engaged, which only openpilot knows at that instant. Two parties each toggling on the same press
+//            end up opposite as soon as one of them refuses or ends an engagement by itself.
+//   removed  when openpilot is not engaged: LATERAL_ONLY_IDLE_MAX heartbeats in a row from the press (safety.h).
+//            That is how a press that turned openpilot off, and a press openpilot refused, end here;
+//            directly by the driver, whatever openpilot does: the cancel button, or cruise switched off;
+//            and by every fault that also clears controls_allowed: a bad or late checked message, a speed
+//            mismatch, a relay malfunction.
 // It allows the steering message only. Nothing longitudinal and no button message asks get_lateral_allowed().
-// The button is read from the car's own Steering_Data_FD1 on the main bus; what openpilot sends is never received.
+// The buttons are read from the car's own Steering_Data_FD1 on the main bus; what openpilot sends is never received.
 #define FORD_PARAM_LAT_ONLY 8U
 
 static bool ford_lat_only_enabled(void) {
@@ -222,18 +227,20 @@ static void ford_rx_hook(const CANPacket_t *msg) {
     }
   }
 
-  // The driver's lane centering button. Only in the rx checks, so only delivered here, when lateral-only is opted in
+  // The driver's buttons. Only in the rx checks, so only delivered here, when lateral-only is opted in
   if (msg_matches(msg, FORD_Steering_Data_FD1, FORD_MAIN_BUS)) {
-    // Signal: TjaButtnOnOffPress
+    // Signal: TjaButtnOnOffPress (lane centering): a press asks for lateral-only
     bool pressed = (msg->data[5] & 0x1U) != 0U;
     if (pressed && !safety.ford_lat_button_prev && ford_lat_only_enabled()) {
-      if (safety.lateral_only_allowed) {
-        safety.lateral_only_allowed = false;
-      } else {
-        safety.lateral_only_allowed = safety.ford_cruise_available && !safety.relay_malfunction && !safety.safety_rx_checks_invalid;
-      }
+      safety.lateral_only_allowed = safety.ford_cruise_available && !safety.relay_malfunction && !safety.safety_rx_checks_invalid;
+      safety.lateral_only_idle = 0U;
     }
     safety.ford_lat_button_prev = pressed;
+
+    // Signal: CcAslButtnCnclPress (cancel): always off, and it wins over a lane centering press in the same message
+    if ((msg->data[1] & 0x1U) != 0U) {
+      safety.lateral_only_allowed = false;
+    }
   }
 }
 
