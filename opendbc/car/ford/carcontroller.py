@@ -44,6 +44,7 @@ class CarController(CarControllerBase):
     self.path_angle_test = path_angle.PathAngleTest()
     self.path_angle_request = 0
     self.path_angle_last = 0
+    self.path_angle_withdrawn = False
     self.accel = 0.0
     self.gas = 0.0
     self.brake_request = False
@@ -79,6 +80,9 @@ class CarController(CarControllerBase):
     path_angle_test = self.path_angle_test if self.CP.flags & FordFlags.PATH_ANGLE else None
     if path_angle_test is not None:
       path_angle_test.buttons(CS.out.buttonEvents)
+    # Whether the PSCM is asked to steer. Not only CC.latActive: an aborted path angle run withdraws the request
+    # itself, in the frame it aborts, until the driver disengages and re-engages.
+    lat_active = CC.latActive and not self.path_angle_withdrawn
 
     # send steer msg at 20Hz
     if (self.frame % CarControllerParams.STEER_STEP) == 0:
@@ -102,14 +106,19 @@ class CarController(CarControllerBase):
         apply_curvature = float(np.clip(apply_curvature, current_curvature - CarControllerParams.CURVATURE_ERROR,
                                         current_curvature + CarControllerParams.CURVATURE_ERROR))
       apply_curvature = CarControllerParams.CURVATURE_LIMITS.apply_limits(apply_curvature, self.apply_curvature_last, CS.out.vEgoRaw,
-                                                                          0., CC.latActive, CarControllerParams.STEER_STEP)
+                                                                          0., lat_active, CarControllerParams.STEER_STEP)
       self.apply_curvature_last = apply_curvature
 
       # low-speed path angle: a prescribed profile on the driver's button. It reads latActive and the car's state, not
       # actuators, and it starts only once the curvature command is zero.
       if path_angle_test is not None:
         self.path_angle_request = path_angle_test.update(CS.out, CC.latActive, self.apply_curvature_last == 0)
-        self.path_angle_last = path_angle.limit(self.path_angle_request, self.path_angle_last, CS.out.vEgoRaw, CC.latActive)
+        self.path_angle_withdrawn = path_angle_test.withdrawn
+        if self.path_angle_withdrawn:
+          # aborted in this frame, or still withdrawn: no request, and nothing in the signals
+          lat_active = False
+          self.apply_curvature_last = 0.
+        self.path_angle_last = path_angle.limit(self.path_angle_request, self.path_angle_last, CS.out.vEgoRaw, lat_active)
 
       if self.CP.flags & FordFlags.CANFD:
         # TODO: extended mode
@@ -118,7 +127,7 @@ class CarController(CarControllerBase):
         # steer actuation, the other three signals are necessary. Ford controls vehicles differently than most other makes.
         # A detailed explanation on ford control can be found here:
         # https://www.f150gen14.com/forum/threads/introducing-bluepilot-a-ford-specific-fork-for-comma3x-openpilot.24241/#post-457706
-        mode = 1 if CC.latActive else 0
+        mode = 1 if lat_active else 0
         counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
         if self.path_angle_last != 0:
           # wire units straight to the signal: what was limited is what is packed
@@ -127,7 +136,7 @@ class CarController(CarControllerBase):
         else:
           can_sends.append(fordcan.create_lat_ctl2_msg(self.packer, self.CAN, mode, 0., 0., -self.apply_curvature_last, 0., counter))
       else:
-        can_sends.append(fordcan.create_lat_ctl_msg(self.packer, self.CAN, CC.latActive, 0., 0., -self.apply_curvature_last, 0.))
+        can_sends.append(fordcan.create_lat_ctl_msg(self.packer, self.CAN, lat_active, 0., 0., -self.apply_curvature_last, 0.))
 
     # send lka msg at 33Hz
     if (self.frame % CarControllerParams.LKA_STEP) == 0:
@@ -175,10 +184,10 @@ class CarController(CarControllerBase):
       self.gas = gas
 
     ### ui ###
-    send_ui = (self.main_on_last != main_on) or (self.lkas_enabled_last != CC.latActive) or (self.steer_alert_last != steer_alert)
+    send_ui = (self.main_on_last != main_on) or (self.lkas_enabled_last != lat_active) or (self.steer_alert_last != steer_alert)
     # send lkas ui msg at 1Hz or if ui state changes
     if (self.frame % CarControllerParams.LKAS_UI_STEP) == 0 or send_ui:
-      can_sends.append(fordcan.create_lkas_ui_msg(self.packer, self.CAN, main_on, CC.latActive, steer_alert, hud_control, CS.lkas_status_stock_values))
+      can_sends.append(fordcan.create_lkas_ui_msg(self.packer, self.CAN, main_on, lat_active, steer_alert, hud_control, CS.lkas_status_stock_values))
 
     # send acc ui msg at 5Hz or if ui state changes
     if hud_control.leadDistanceBars != self.lead_distance_bars_last:
@@ -187,12 +196,12 @@ class CarController(CarControllerBase):
 
     if (self.frame % CarControllerParams.ACC_UI_STEP) == 0 or send_ui:
       show_distance_bars = self.frame - self.distance_bar_frame < 400
-      can_sends.append(fordcan.create_acc_ui_msg(self.packer, self.CAN, self.CP, main_on, CC.latActive,
+      can_sends.append(fordcan.create_acc_ui_msg(self.packer, self.CAN, self.CP, main_on, lat_active,
                                                  fcw_alert, CS.out.cruiseState.standstill, show_distance_bars,
                                                  hud_control, CS.acc_tja_status_stock_values))
 
     self.main_on_last = main_on
-    self.lkas_enabled_last = CC.latActive
+    self.lkas_enabled_last = lat_active
     self.steer_alert_last = steer_alert
     self.lead_distance_bars_last = hud_control.leadDistanceBars
 

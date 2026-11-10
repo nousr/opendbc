@@ -257,34 +257,95 @@ class TestPathAngleBench(unittest.TestCase):
 
   # ---- ending a run
 
-  def test_a_run_ends_in_the_frame_the_reason_appears(self):
-    reasons = {
-      "driver steering": [{"torque": 0.6}, {"torque": -0.6}, {"pressed": True}],
-      "lateral control not active": [{"lat_active": False}],
-      "speed outside the band": [{"v": P.PATH_ANGLE_MAX_SPEED + 0.05}, {"v": 0.3}],
-      "steering fault": [{"fault": True}],
-      "not in drive": [{"gear": GearShifter.neutral}],
-      "stopped by the driver's button": [{"button": True}],
-    }
-    for why, cases in reasons.items():
+  ABORTS = {
+    "driver steering": [{"torque": 0.6}, {"torque": -0.6}, {"pressed": True}],
+    "lateral control not active": [{"lat_active": False}],
+    "speed outside the band": [{"v": P.PATH_ANGLE_MAX_SPEED + 0.05}, {"v": 0.3}],
+    "steering fault": [{"fault": True}],
+    "not in drive": [{"gear": GearShifter.neutral}],
+    "stopped by the driver's button": [{"button": True}],
+  }
+
+  def test_an_abort_zeroes_the_command_and_withdraws_the_request_in_the_same_frame(self):
+    for why, cases in self.ABORTS.items():
       for kw in cases:
-        for after in (3, 12, 30):                               # winding up, at the level, well into the hold
+        for after in (3, 12, 30, 55):                           # winding up, at the level, into the hold, letting go
           with self.subTest(why=why, kw=kw, after=after):
             b = self.bench(0.3, -0.2)
             b.run(12)
             b.steer_frame(button=True)
             b.run(after)
             self.assertTrue(b.test.running)
+            self.assertEqual(b.rows[-1]["mode"], 1)
             self.assertNotEqual(b.rows[-1]["path_angle"], 0)
-            row = b.steer_frame(**kw)
-            self.assertEqual(row["path_angle"], 0, "zero in the very next frame")
-            self.assertEqual(row["mode"], 1 if kw.get("lat_active", True) else 0)
-            self.assertEqual((b.test.ended, b.test.stage), (why, Stage.armed))
-            self.assertEqual(b.refused, [], "and panda lets the release out")
-            # cut short, the same profile is still next
-            rows = b.run(12) + b.play()
-            self.assertGreater(max(r["path_angle"] for r in rows), 0)
-            self.assertEqual(b.test.index, 1)
+            row = b.steer_frame(model_curvature=0.02, **kw)
+            self.assertEqual((row["mode"], row["path_angle"], row["curvature"], row["ramp"]), (0, 0, 0, 0),
+                             "no steering request, and nothing in the signals, in the very next frame")
+            self.assertEqual((b.test.ended, b.test.stage), (why, Stage.aborted))
+            self.assertTrue(row["accepted"])
+            self.assertEqual(b.refused, [])
+
+  def test_after_an_abort_nothing_brings_the_request_back_but_disengaging(self):
+    for why, cases in self.ABORTS.items():
+      kw = cases[0]
+      with self.subTest(why=why):
+        b = self.bench(0.3, -0.2)
+        b.run(12)
+        b.steer_frame(button=True)
+        b.run(12)
+        b.steer_frame(**kw)
+        # the reason gone, hands off, in the band, engaged the whole time: for five seconds and a dozen presses
+        rows = []
+        for i in range(100):
+          rows.append(b.steer_frame(button=i % 8 == 0, model_curvature=0.02))
+        # (also when the abort was lateral dropping out for that one frame: a blip is not the driver disengaging)
+        self.assertTrue(all((r["mode"], r["path_angle"], r["curvature"]) == (0, 0, 0) for r in rows), "still withdrawn")
+        self.assertEqual(b.test.stage, Stage.aborted)
+        b.steer_frame(lat_active=False)                          # the driver disengages...
+        self.assertEqual(b.test.stage, Stage.armed)
+        row = b.steer_frame(button=True)                         # ...and engages again: steering is requested, at zero
+        self.assertEqual((row["mode"], row["path_angle"], row["curvature"]), (1, 0, 0), "and a press this soon starts nothing")
+        b.run(12)
+        rows = b.play()
+        self.assertEqual(max(r["path_angle"] for r in rows), 600, "the profile that was cut short, again")
+        self.assertEqual((b.test.ended, b.test.index), ("completed", 1))
+        self.assertEqual(b.refused, [])
+
+  def test_a_completed_run_keeps_the_request_through_its_own_unwind(self):
+    b = self.bench(0.3, -0.2)
+    b.run(12)
+    rows = b.play() + b.run(20)
+    self.assertTrue(all(r["mode"] == 1 for r in rows), "controlled unwind: the PSCM stays in control down to zero and after")
+    self.assertEqual((b.test.ended, b.test.stage), ("completed", Stage.armed))
+    self.assertFalse(b.test.withdrawn)
+
+  def test_disarming_does_not_hand_back_a_withdrawn_request(self):
+    b = self.bench(0.3)
+    b.run(12)
+    b.steer_frame(button=True)
+    b.run(12)
+    b.steer_frame(torque=0.8)
+    b.test.disarm()
+    self.assertTrue(all(r["mode"] == 0 and r["curvature"] == 0 for r in b.run(20, model_curvature=0.02)))
+    b.steer_frame(lat_active=False)
+    self.assertEqual(b.test.stage, Stage.idle)
+    self.assertNotEqual(b.run(20, model_curvature=0.02)[-1]["curvature"], 0, "disengaged and re-engaged with nothing armed: the stock controller")
+
+  def test_the_dash_is_told_when_the_request_is_withdrawn(self):
+    # the lane-centering UI message follows what is actually asked of the PSCM, not openpilot's own state
+    def ui_states(b, n, **kw):
+      seen = []
+      for _ in range(n):
+        b.step(**kw)
+        seen.append(b.CI.CC.lkas_enabled_last)
+      return seen
+    b = self.bench(0.3)
+    b.run(12)
+    b.steer_frame(button=True)
+    b.run(12)
+    self.assertTrue(b.CI.CC.lkas_enabled_last)
+    b.steer_frame(torque=0.8)
+    self.assertEqual(set(ui_states(b, 20)), {False})
 
   def test_a_press_between_steer_frames_counts(self):
     for offset in range(5):

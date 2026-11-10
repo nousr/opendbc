@@ -19,9 +19,15 @@ Bounds on what is sent, each also enforced by panda (opendbc/safety/modes/ford.h
   alone     the curvature command is zero in any frame that carries a path angle
 These are bounds on the command. They are not a bound on the steering response, which is what is being measured.
 
-A run ends at once, and the command goes to zero in the same frame, when the driver steers, presses the button
-again, when lateral control is no longer active, the speed leaves the band, or the PSCM reports a fault. Ending a run
-early costs nothing: it is simply a shorter measurement.
+Two ways a run ends, and they are not the same thing:
+  completed  the profile let go at its own rate. The steering request stays up throughout, because the unwind under
+             control is part of what is measured.
+  aborted    the driver steered or pressed the button again, lateral control went inactive, the speed left the band,
+             the PSCM reported a fault, or the car left drive. In that same frame the command is zero AND the steering
+             request is withdrawn (LatCtl_D2_Rq 0): a zero target would still be the PSCM steering to straight
+             against whoever just took the wheel. The request stays withdrawn, and the button does nothing, until
+             the driver has disengaged lateral control and engaged it again.
+Ending a run early costs nothing: it is simply a shorter measurement.
 """
 from dataclasses import dataclass
 from enum import StrEnum
@@ -90,12 +96,14 @@ class Stage(StrEnum):
   hold = "hold"
   fall = "fall"
   done = "done"          # every profile has been played; still armed, so the model still steers nothing
+  aborted = "aborted"    # a run was cut short: the steering request is withdrawn until lateral is disengaged and re-engaged
 
 
 class PathAngleTest:
   """Plays armed Profiles, one per press of the driver's button. buttons() is called on every car state, update()
-  once per steer frame (20 Hz). A profile that completes makes way for the next; one that was cut short is kept, so
-  the next press repeats it. After the last one the button does nothing more, until the host disarms."""
+  once per steer frame (20 Hz). A profile that completes makes way for the next. One that was cut short is kept, but
+  the test is then `aborted`: it asks for no steering and ignores the button until lateral control has been seen
+  inactive, after which the next press repeats it. After the last profile the button does nothing more."""
 
   def __init__(self):
     self.hz = STEER_HZ
@@ -117,8 +125,11 @@ class PathAngleTest:
     self.stage = Stage.armed if self.profiles else Stage.idle
 
   def disarm(self) -> None:
+    """Forget the profiles. A withdrawn steering request stays withdrawn until lateral control is seen inactive."""
     self._end("disarmed")
-    self.profiles, self.stage = [], Stage.idle
+    self.profiles = []
+    if self.stage != Stage.aborted:
+      self.stage = Stage.idle
 
   @property
   def running(self) -> bool:
@@ -134,12 +145,20 @@ class PathAngleTest:
   def profile(self) -> Profile | None:
     return self.profiles[self.index] if self.index < len(self.profiles) else None
 
+  @property
+  def withdrawn(self) -> bool:
+    """The controller must not ask the PSCM for steering at all: a run was aborted and the driver has not yet
+    disengaged and re-engaged."""
+    return self.stage == Stage.aborted
+
   def _end(self, why: str) -> None:
     if self.running:
       self.ended = why
       if why == "completed":
         self.index += 1
-      self.stage = Stage.armed if self.profile is not None else Stage.done
+        self.stage = Stage.armed if self.profile is not None else Stage.done
+      else:
+        self.stage = Stage.aborted
     self.target, self.frames = 0, 0
 
   def buttons(self, button_events) -> None:
@@ -170,7 +189,14 @@ class PathAngleTest:
     if self.running:
       if pressed or why:
         self._end(why or "stopped by the driver's button")
+        self.ready = 0
         return 0
+    elif self.stage == Stage.aborted:
+      # Only the driver disengaging gives the steering request back; the button, time and a clear state do not.
+      if not lat_active:
+        self.stage = (Stage.armed if self.profile is not None else Stage.done) if self.profiles else Stage.idle
+      self.ready = 0
+      return 0
     elif self.stage == Stage.armed and pressed and was_ready and not why and curvature_zero:
       self.stage, self.frames, self.target, self.ended = Stage.rise, 0, 0, ""
       self.runs += 1
