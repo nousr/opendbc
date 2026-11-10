@@ -525,5 +525,176 @@ class TestFordCANFDLongitudinalSafety(TestFordLongitudinalSafetyBase):
                                MSG_IPMA_Data]}
 
 
+class TestFordCANFDPathAngleSafety(TestFordCANFDLongitudinalSafety):
+  """The low-speed path angle command, opted in. Everything the stock configuration checks still holds; a path
+  angle is accepted only inside these bounds. Each frame goes through safety_tx_hook, so both safety copies check
+  it, and tearDown fails the test if they ever disagreed."""
+
+  SAFETY_PARAM = FordSafetyFlags.LONG_CONTROL | FordSafetyFlags.CANFD | FordSafetyFlags.PATH_ANGLE
+
+  TO_CAN = 2000        # wire units per rad
+  MAX = 980            # 0.49 rad
+  MAX_DELTA = 100      # per frame winding up
+  MAX_SPEED = 4.5      # m/s
+  SPEED = 2.0
+
+  def _ready(self, speed=None, param=None):
+    """Fresh safety state, controls allowed, driving straight at `speed`."""
+    self.safety.set_safety_hooks(self.SAFETY_MODEL, self.SAFETY_PARAM if param is None else param)
+    self.safety.init_tests()
+    self.safety.set_controls_allowed(True)
+    self._reset_curvature_measurement(0, self.SPEED if speed is None else speed)
+
+  def _pa(self, can: int, enabled: bool = True, curvature: float = 0., path_offset: float = 0., curvature_rate: float = 0.):
+    """One frame with the path angle at `can` wire units about zero."""
+    return self._tx(self._lat_ctl_msg(enabled, path_offset, can / self.TO_CAN, curvature, curvature_rate))
+
+  def _raw_pa(self, raw: int):
+    """A frame with the path angle field set to a raw value the DBC range would not pack."""
+    msg = self._lat_ctl_msg(True, 0, 0, 0, 0)
+    dat = bytearray(bytes(msg[0].data)[:8])
+    dat[3] = (dat[3] & 0xE0) | ((raw >> 6) & 0x1F)
+    dat[4] = (dat[4] & 0x03) | ((raw & 0x3F) << 2)
+    msg[0].data = bytes(dat)
+    return self._tx(msg)
+
+  def _wind_to(self, can: int):
+    step = self.MAX_DELTA if can > 0 else -self.MAX_DELTA
+    at = 0
+    while at != can:
+      at = can if abs(can - at) <= self.MAX_DELTA else at + step
+      self.assertTrue(self._pa(at), at)
+    self.assertEqual(self.safety.get_ford_path_angle_last(), can)
+
+  def test_steer_allowed(self):
+    # the stock sweep expects any path angle to be refused; with the opt-in, zero path angle behaves as stock
+    for speed in (self.CURVATURE_ERROR_MIN_SPEED - 1, self.CURVATURE_ERROR_MIN_SPEED + 1):
+      max_curvature_can = self._get_max_curvature_can(speed)
+      for controls_allowed in (True, False):
+        for steer_control_enabled in (True, False):
+          for path_offset in (-2.0, 0.0, 2.0):
+            for curvature_rate in (-0.001, 0.0, 0.001):
+              for curvature in (-0.02, -0.01, 0.0, 0.01, 0.02):
+                self.safety.set_controls_allowed(controls_allowed)
+                self._set_prev_desired_angle(curvature)
+                self._reset_curvature_measurement(curvature, speed)
+                should_tx = path_offset == 0 and curvature_rate == 0
+                should_tx = should_tx and (controls_allowed if steer_control_enabled else curvature == 0)
+                should_tx = should_tx and abs(round(curvature * self.DEG_TO_CAN)) <= max_curvature_can
+                with self.subTest(controls_allowed=controls_allowed, steer_control_enabled=steer_control_enabled, speed=speed,
+                                  path_offset=path_offset, curvature_rate=curvature_rate, curvature=curvature):
+                  self.assertEqual(should_tx, self._tx(self._lat_ctl_msg(steer_control_enabled, path_offset, 0, curvature, curvature_rate)))
+
+  def test_path_angle_wind_up_is_rate_limited(self):
+    for sign in (1, -1):
+      with self.subTest(sign=sign):
+        self._ready()
+        self.assertTrue(self._pa(sign * self.MAX_DELTA))
+        self.assertTrue(self._pa(sign * 2 * self.MAX_DELTA))
+        self.assertFalse(self._pa(sign * (3 * self.MAX_DELTA + 1)), "one unit over the step")
+        self.assertEqual(self.safety.get_ford_path_angle_last(), 0, "a refused frame is not on the bus")
+        self.assertFalse(self._pa(sign * 2 * self.MAX_DELTA), "so the next is checked from zero")
+        self.assertTrue(self._pa(sign * self.MAX_DELTA))
+
+  def test_path_angle_step_from_zero(self):
+    # the failure of a rate check kept outside the per-copy state: copy B updates the shared last value, copy A then
+    # compares the frame with itself and allows any step. Here both copies refuse, and they agree.
+    self._ready()
+    for can in (self.MAX_DELTA + 1, 200, 900, self.MAX, -(self.MAX_DELTA + 1), -900, -self.MAX):
+      with self.subTest(can=can):
+        self.assertFalse(self._pa(can))
+        self.assertFalse(self.safety.safety_redundancy_fault)
+        self.assertTrue(self._pa(0))
+
+  def test_path_angle_range(self):
+    for sign in (1, -1):
+      with self.subTest(sign=sign):
+        self._ready()
+        self._wind_to(sign * self.MAX)
+        self.assertTrue(self._pa(sign * self.MAX), "holding the limit")
+        self.assertFalse(self._pa(sign * (self.MAX + 1)))
+    # the ends of the 11-bit field, which the DBC range leaves unused on the left
+    self._ready()
+    self._wind_to(self.MAX)
+    for raw in (1000 + self.MAX + 1, 2047):
+      self.assertFalse(self._raw_pa(raw), raw)
+
+  def test_path_angle_letting_go_is_not_limited(self):
+    for sign in (1, -1):
+      for to in (900, 500, 1, 0):
+        with self.subTest(sign=sign, to=to):
+          self._ready()
+          self._wind_to(sign * self.MAX)
+          self.assertTrue(self._pa(sign * to))
+          self.assertEqual(self.safety.get_ford_path_angle_last(), sign * to)
+
+  def test_path_angle_may_not_jump_across_zero(self):
+    for sign in (1, -1):
+      with self.subTest(sign=sign):
+        self._ready()
+        self._wind_to(sign * 600)
+        self.assertFalse(self._pa(-sign * 10), "smaller, but on the other side: 610 units in a frame")
+        self._wind_to(sign * 30)
+        self.assertTrue(self._pa(-sign * 20), "across zero within one step")
+
+  def test_path_angle_wire_wrap_is_refused(self):
+    # a hard right that leaves the signal's range re-enters it as a hard left: raw 80 (-0.46 rad) to raw 2018 (+0.509)
+    self._ready()
+    self._wind_to(-920)
+    self.assertFalse(self._raw_pa(2018))
+    self.assertEqual(self.safety.get_ford_path_angle_last(), 0)
+    self.assertFalse(self.safety.safety_redundancy_fault)
+
+  def test_path_angle_speed_limit(self):
+    for speed, allowed in ((0.0, True), (3.0, True), (self.MAX_SPEED - 0.1, True), (self.MAX_SPEED + 0.1, False), (9.0, False), (15.0, False)):
+      with self.subTest(speed=speed):
+        self._ready(speed)
+        self.assertEqual(self._pa(self.MAX_DELTA), allowed)
+        self.assertTrue(self._pa(0), "zero is acceptable at any speed")
+    # accelerating through the limit with a command held: the fastest recent sample decides
+    self._ready()
+    self._wind_to(400)
+    self._rx(self._speed_msg(self.MAX_SPEED + 0.2))     # one sample of six; both speed sources, or they mismatch
+    self._rx(self._speed_msg_2(self.MAX_SPEED + 0.2))
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertFalse(self._pa(400))
+    self.assertFalse(self._pa(350), "letting go slowly is not an exception: above the speed the signal is zero")
+    self.assertTrue(self._pa(0))
+
+  def test_path_angle_alone(self):
+    # one signal at a time: no path angle in a frame that carries curvature
+    self._ready()
+    self.assertFalse(self._pa(self.MAX_DELTA, curvature=0.001))
+    self.assertFalse(self._pa(self.MAX_DELTA, path_offset=0.5))
+    self.assertFalse(self._pa(self.MAX_DELTA, curvature_rate=0.0005))
+    self.assertTrue(self._pa(self.MAX_DELTA))
+
+  def test_path_angle_needs_controls_allowed_and_the_request(self):
+    self._ready()
+    self._wind_to(300)
+    self.safety.set_controls_allowed(False)
+    self.assertFalse(self._pa(300))
+    self.assertFalse(self._pa(10))
+    self.safety.set_controls_allowed(True)
+    self.assertFalse(self._pa(300), "and it does not resume where it was")
+    self.assertTrue(self._pa(self.MAX_DELTA))
+    self.assertFalse(self._pa(self.MAX_DELTA, enabled=False), "not with the request bit clear")
+    self.assertTrue(self._pa(0, enabled=False))
+
+  def test_a_refused_curvature_frame_resets_the_path_angle(self):
+    self._ready()
+    self._wind_to(300)
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0, 0, 0.0005)))
+    self.assertEqual(self.safety.get_ford_path_angle_last(), 0)
+
+  def test_path_angle_is_refused_without_the_opt_in(self):
+    for param in (FordSafetyFlags.CANFD, FordSafetyFlags.CANFD | FordSafetyFlags.LONG_CONTROL):
+      with self.subTest(param=int(param)):
+        self._ready(param=param)
+        self.assertFalse(self._pa(1))
+        self.assertFalse(self._pa(-1))
+        self.assertTrue(self._pa(0))
+
+
 if __name__ == "__main__":
   unittest.main()

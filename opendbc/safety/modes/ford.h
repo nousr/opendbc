@@ -96,6 +96,57 @@ static const CurvatureSteeringLimits FORD_STEERING_LIMITS = {
   .max_steer_power = 0,               // disabled, Ford has no steed power signal
 };
 
+// Low-speed path angle command (opt-in, debug builds only). Wire units of LatCtlPath_An_Actl: 0.0005 rad, raw 1000 is zero,
+// positive is left. These bound what may be sent. They say nothing about how far the steering then moves: that is
+// measured on the car, and nothing here stands in for it.
+#define FORD_PARAM_PATH_ANGLE 4U
+#define FORD_PATH_ANGLE_MAX 980            // 0.49 rad either way: inside the signal's range [-1000, 1047] on both sides
+#define FORD_PATH_ANGLE_MAX_DELTA 100      // per 20 Hz frame while winding up: 0.05 rad, 1.0 rad/s
+#define FORD_PATH_ANGLE_MAX_SPEED 4.5      // m/s: no path angle command above this
+
+static bool ford_path_angle_enabled(void) {
+#ifdef ALLOW_DEBUG
+  return GET_FLAG(safety_setup.current_safety_param, FORD_PARAM_PATH_ANGLE);
+#else
+  return false;
+#endif
+}
+
+// desired_path_angle: wire units about zero. curvature_requested: the same frame carries a curvature command.
+static bool ford_path_angle_cmd_checks(int desired_path_angle, bool curvature_requested, bool steer_control_enabled) {
+  bool violation = false;
+
+  if (!ford_path_angle_enabled() || !safety.controls_allowed || !steer_control_enabled) {
+    // not opted in, or not steering: the signal stays at zero
+    violation |= desired_path_angle != 0;
+  } else if (desired_path_angle != 0) {
+    const int last = safety.ford_path_angle_last;
+
+    // range, checked as encoded: a value outside it cannot wrap to the other side
+    violation |= safety_max_limit_check(desired_path_angle, FORD_PATH_ANGLE_MAX, -FORD_PATH_ANGLE_MAX);
+
+    // one signal at a time: the response to path angle with curvature is not measured
+    violation |= curvature_requested;
+
+    // low speed only, by the fastest recent speed sample
+    violation |= (safety.vehicle_speed.max / VEHICLE_SPEED_FACTOR) > FORD_PATH_ANGLE_MAX_SPEED;
+
+    // Letting go toward zero on the same side is always allowed, as dropping the request is.
+    // Winding up, or crossing zero, is rate limited from the last accepted command.
+    const bool unwinding = ((last > 0) && (desired_path_angle > 0) && (desired_path_angle <= last)) ||
+                           ((last < 0) && (desired_path_angle < 0) && (desired_path_angle >= last));
+    if (!unwinding) {
+      violation |= safety_max_limit_check(desired_path_angle, last + FORD_PATH_ANGLE_MAX_DELTA, last - FORD_PATH_ANGLE_MAX_DELTA);
+    }
+  } else {
+    // zero is always acceptable
+  }
+
+  // a refused frame is not on the bus: the next one is checked from zero
+  safety.ford_path_angle_last = violation ? 0 : desired_path_angle;
+  return violation;
+}
+
 static void ford_rx_hook(const CANPacket_t *msg) {
   // Update in motion state from standstill signal
   if (msg_matches(msg, FORD_DesiredTorqBrk, FORD_MAIN_BUS)) {
@@ -251,11 +302,20 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     unsigned int raw_path_offset = ((msg->data[4] & 0x3U) << 8) | msg->data[5];
 
     // These signals are not yet tested with the current safety limits
-    bool violation = (raw_curvature_rate != FORD_CANFD_INACTIVE_CURVATURE_RATE) || (raw_path_angle != FORD_INACTIVE_PATH_ANGLE) || (raw_path_offset != FORD_INACTIVE_PATH_OFFSET);
+    bool violation = (raw_curvature_rate != FORD_CANFD_INACTIVE_CURVATURE_RATE) || (raw_path_offset != FORD_INACTIVE_PATH_OFFSET);
+
+    // Path angle: zero unless the low-speed path angle command is opted in, then bounded
+    int desired_path_angle = (int)raw_path_angle - (int)FORD_INACTIVE_PATH_ANGLE;
+    violation |= ford_path_angle_cmd_checks(desired_path_angle, raw_curvature != FORD_INACTIVE_CURVATURE, steer_control_enabled);
 
     // Check angle error and steer_control_enabled
     int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;  // /FORD_STEERING_LIMITS.curvature_to_can to get real curvature
     violation |= steer_curvature_cmd_checks(desired_curvature, 0, steer_control_enabled, FORD_STEERING_LIMITS);
+
+    if (violation) {
+      // nothing of a refused frame carries over
+      safety.ford_path_angle_last = 0;
+    }
 
     if (violation) {
       tx = false;

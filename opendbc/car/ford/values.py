@@ -30,6 +30,14 @@ class CarControllerParams:
   CURVATURE_LIMITS: CurvatureSteeringLimits = CurvatureSteeringLimits(0.02)  # Max curvature for steering command, m^-1
   CURVATURE_ERROR = 0.002  # ~6 degrees at 10 m/s, ~10 degrees at 35 m/s
 
+  # Low-speed path angle command (opt-in, see path_angle.py). Wire units of LatCtlPath_An_Actl: 0.0005 rad, positive left.
+  # The first three mirror opendbc/safety/modes/ford.h; test_path_angle.py holds the two together.
+  PATH_ANGLE_TO_CAN = 2000        # wire units per rad
+  PATH_ANGLE_MAX_CAN = 980        # 0.49 rad
+  PATH_ANGLE_MAX_DELTA_CAN = 100  # per steer frame while winding up: 0.05 rad, 1.0 rad/s
+  PATH_ANGLE_MAX_SPEED = 4.0      # m/s; panda refuses above 4.5, the margin covers the two reading speed at different times
+  PATH_ANGLE_RAMP_TYPE = 2        # LatCtlRampType_D_Rq "Fast": what this PSCM was sent with path angle on 2026-11-05
+
   ACCEL_MAX = 2.0               # m/s^2 max acceleration
   ACCEL_MIN = -3.5              # m/s^2 max deceleration
   MIN_GAS = -0.5
@@ -42,6 +50,7 @@ class CarControllerParams:
 class FordSafetyFlags(IntFlag):
   LONG_CONTROL = 1
   CANFD = 2
+  PATH_ANGLE = 4  # low-speed path angle command; honoured by debug panda builds only
 
 
 class FordFlags(IntFlag):
@@ -50,6 +59,9 @@ class FordFlags(IntFlag):
 
   # Static flags
   CANFD = 1
+
+  # Opt-in, set by the host through path_angle.enable(), never by fingerprint
+  PATH_ANGLE = 4
 
 
 class RADAR:

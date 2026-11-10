@@ -2,7 +2,7 @@ import math
 import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
-from opendbc.car.ford import fordcan
+from opendbc.car.ford import fordcan, path_angle
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 
@@ -40,6 +40,10 @@ class CarController(CarControllerBase):
 
     self.apply_curvature_last = 0
     self.anti_overshoot_curvature_last = 0
+    # low-speed path angle command, wire units; only ever nonzero with FordFlags.PATH_ANGLE and a run in progress
+    self.path_angle_test = path_angle.PathAngleTest()
+    self.path_angle_request = 0
+    self.path_angle_last = 0
     self.accel = 0.0
     self.gas = 0.0
     self.brake_request = False
@@ -72,6 +76,10 @@ class CarController(CarControllerBase):
       can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.camera, CS.buttons_stock_values, tja_toggle=True))
 
     ### lateral control ###
+    path_angle_test = self.path_angle_test if self.CP.flags & FordFlags.PATH_ANGLE else None
+    if path_angle_test is not None:
+      path_angle_test.buttons(CS.out.buttonEvents)
+
     # send steer msg at 20Hz
     if (self.frame % CarControllerParams.STEER_STEP) == 0:
       # Bronco and some other cars consistently overshoot curv requests
@@ -81,6 +89,11 @@ class CarController(CarControllerBase):
         apply_curvature = self.anti_overshoot_curvature_last
       else:
         apply_curvature = actuators.curvature
+
+      # With path angle profiles armed the model steers nothing: the curvature command goes to zero under its own
+      # limits and stays there until they are disarmed.
+      if path_angle_test is not None and path_angle_test.armed:
+        apply_curvature = 0.
 
       # apply rate limits, curvature error limit, and clip to signal range
       current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
@@ -92,6 +105,12 @@ class CarController(CarControllerBase):
                                                                           0., CC.latActive, CarControllerParams.STEER_STEP)
       self.apply_curvature_last = apply_curvature
 
+      # low-speed path angle: a prescribed profile on the driver's button. It reads latActive and the car's state, not
+      # actuators, and it starts only once the curvature command is zero.
+      if path_angle_test is not None:
+        self.path_angle_request = path_angle_test.update(CS.out, CC.latActive, self.apply_curvature_last == 0)
+        self.path_angle_last = path_angle.limit(self.path_angle_request, self.path_angle_last, CS.out.vEgoRaw, CC.latActive)
+
       if self.CP.flags & FordFlags.CANFD:
         # TODO: extended mode
         # Ford uses four individual signals to dictate how to drive to the car. Curvature alone (limited to 0.02 m^-1)
@@ -101,7 +120,12 @@ class CarController(CarControllerBase):
         # https://www.f150gen14.com/forum/threads/introducing-bluepilot-a-ford-specific-fork-for-comma3x-openpilot.24241/#post-457706
         mode = 1 if CC.latActive else 0
         counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
-        can_sends.append(fordcan.create_lat_ctl2_msg(self.packer, self.CAN, mode, 0., 0., -self.apply_curvature_last, 0., counter))
+        if self.path_angle_last != 0:
+          # wire units straight to the signal: what was limited is what is packed
+          can_sends.append(fordcan.create_lat_ctl2_msg(self.packer, self.CAN, mode, 0., self.path_angle_last / CarControllerParams.PATH_ANGLE_TO_CAN,
+                                                       0., 0., counter, ramp_type=CarControllerParams.PATH_ANGLE_RAMP_TYPE))
+        else:
+          can_sends.append(fordcan.create_lat_ctl2_msg(self.packer, self.CAN, mode, 0., 0., -self.apply_curvature_last, 0., counter))
       else:
         can_sends.append(fordcan.create_lat_ctl_msg(self.packer, self.CAN, CC.latActive, 0., 0., -self.apply_curvature_last, 0.))
 

@@ -325,6 +325,9 @@ typedef struct {
 
   CurvatureSteeringState curvature_state;
 
+  // last accepted Ford path angle command, wire units. Per copy: both copies check every frame against their own
+  int ford_path_angle_last;
+
   // time since safety mode has been changed
   uint32_t safety_mode_cnt;
 

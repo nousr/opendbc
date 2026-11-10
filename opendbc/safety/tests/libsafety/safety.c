@@ -196,6 +196,10 @@ int get_desired_curvature_last(void){
   return safety.curvature_state.desired_last;
 }
 
+int get_ford_path_angle_last(void){
+  return safety.ford_path_angle_last;
+}
+
 void set_curvature_meas(int min, int max){
   SAFETY_SET(curvature_state.meas.min, min);
   SAFETY_SET(curvature_state.meas.max, max);
